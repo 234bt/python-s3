@@ -1,0 +1,231 @@
+# ==========================================================
+# VeloraXF LEVEL 10 – ULTIMATE ONE-FILE AI BUSINESS BOT
+# ==========================================================
+
+import os, time, threading, logging, sqlite3
+from datetime import datetime, timedelta
+from telegram import Update, ChatPermissions
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+import openai, pyttsx3
+from langdetect import detect
+
+# ================= CONFIG =================
+BOT_TOKEN = os.getenv("BOT_TOKEN") or input("Enter BOT_TOKEN: ")
+OPENAI_KEY = os.getenv("OPENAI_KEY") or input("Enter OPENAI_KEY: ")
+OWNER_ID = int(os.getenv("OWNER_ID") or input("Enter OWNER_ID: "))
+CHANNEL_ID = os.getenv("CHANNEL_ID") or input("Enter CHANNEL_ID or username: ")
+
+openai.api_key = OPENAI_KEY
+BOT_NAME = "VeloraXF Assistant"
+BUSINESS = "Online Marketing & Digital Opportunities"
+FOLLOW_UP_MIN = 60
+VOICE_TRIGGERS = ["urgent","problem","confused","help","question","vip"]
+DASHBOARD_REFRESH = 5
+
+logging.basicConfig(level=logging.INFO)
+
+# ================= DATABASE =================
+db = sqlite3.connect("veloraxf_level10_ultimate.db", check_same_thread=False)
+c = db.cursor()
+
+c.execute("""CREATE TABLE IF NOT EXISTS users(
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    language TEXT,
+    category TEXT,
+    last_seen TEXT
+)""")
+c.execute("""CREATE TABLE IF NOT EXISTS memory(
+    user_id INTEGER,
+    key TEXT,
+    value TEXT
+)""")
+c.execute("""CREATE TABLE IF NOT EXISTS leads(
+    user_id INTEGER,
+    stage TEXT,
+    last_contact TEXT,
+    vip INTEGER DEFAULT 0
+)""")
+db.commit()
+
+# ================= VOICE =================
+engine = pyttsx3.init()
+for v in engine.getProperty("voices"):
+    if "female" in v.name.lower():
+        engine.setProperty("voice", v.id)
+        break
+def speak(text):
+    engine.say(text)
+    engine.runAndWait()
+
+# ================= AI RESPONSE =================
+def ai_response(user_text, stage, lang):
+    prompt = f"""
+You are {BOT_NAME}, AI business representative of VeloraXF.
+Business: {BUSINESS}
+User stage: {stage}
+Tone: Friendly for chatting, Professional for business, Strict when necessary
+Goals: Educate, qualify lead, promote VeloraXF ethically
+Never give false promises about income
+Reply in user's language
+"""
+    res = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role":"system","content":prompt},{"role":"user","content":user_text}],
+        max_tokens=300
+    )
+    return res.choices[0].message["content"]
+
+# ================= USER CLASSIFICATION =================
+def classify_user(text):
+    text = text.lower()
+    if any(x in text for x in ["partner","invest","serious","vip"]):
+        return "VIP"
+    if any(x in text for x in ["price","join","how","interested"]):
+        return "INTERESTED"
+    if any(x in text for x in ["just looking","maybe","curious"]):
+        return "CASUAL"
+    return "CASUAL"
+
+# ================= OWNER ALERT =================
+def notify_owner(bot, user, reason):
+    msg = f"🚨 *VeloraXF Alert*\nUser: @{user.username}\nReason: {reason}"
+    bot.send_message(OWNER_ID, msg, parse_mode="Markdown")
+
+# ================= FOLLOW-UP LOOP =================
+def follow_up_loop(bot):
+    while True:
+        time.sleep(900)
+        c.execute("SELECT user_id FROM leads WHERE stage!='CLOSED'")
+        for (uid,) in c.fetchall():
+            bot.send_message(uid,
+                "👋 VeloraXF checking in — would you like to continue where we left off?")
+        db.commit()
+
+# ================= HANDLERS =================
+def start(update: Update, context: CallbackContext):
+    u = update.effective_user
+    c.execute("INSERT OR IGNORE INTO users VALUES(?,?,?,?,?)",
+              (u.id, u.username, "en", "NEW", datetime.utcnow().isoformat()))
+    db.commit()
+    update.message.reply_text(
+        f"Hello 👋 I'm {BOT_NAME}, your AI assistant for VeloraXF.\nHow can I help you today?"
+    )
+
+def handle_message(update: Update, context: CallbackContext):
+    u = update.effective_user
+    text = update.message.text
+    try:
+        lang = detect(text)
+    except:
+        lang = "en"
+    category = classify_user(text)
+    stage = "QUALIFY" if category != "CASUAL" else "CHAT"
+    c.execute("INSERT OR REPLACE INTO leads VALUES(?,?,?,?)",
+              (u.id, stage, datetime.utcnow().isoformat(), 1 if category=="VIP" else 0))
+    db.commit()
+    reply = ai_response(text, stage, lang)
+    update.message.reply_text(reply)
+    if category == "VIP":
+        notify_owner(context.bot, u, "VIP Lead Detected")
+    if any(w in text.lower() for w in VOICE_TRIGGERS):
+        threading.Thread(target=speak, args=(reply,), daemon=True).start()
+
+def warn(update: Update, context: CallbackContext):
+    if update.message.reply_to_message:
+        uid = update.message.reply_to_message.from_user.id
+        context.bot.send_message(uid, "⚠️ Warning issued by VeloraXF moderation.")
+
+def mute(update: Update, context: CallbackContext):
+    if update.message.reply_to_message:
+        minutes = int(context.args[0]) if context.args else 5
+        until = datetime.utcnow() + timedelta(minutes=minutes)
+        context.bot.restrict_chat_member(
+            update.effective_chat.id,
+            update.message.reply_to_message.from_user.id,
+            ChatPermissions(can_send_messages=False),
+            until_date=until
+        )
+
+# ================= DASHBOARD =================
+def clear_screen():
+    os.system("cls" if os.name=="nt" else "clear")
+def dashboard_loop():
+    while True:
+        clear_screen()
+        c.execute("SELECT COUNT(*), category FROM users GROUP BY category")
+        users = c.fetchall()
+        c.execute("SELECT COUNT(*), stage, vip FROM leads GROUP BY stage, vip")
+        leads = c.fetchall()
+        c.execute("SELECT user_id, last_contact FROM leads WHERE stage != 'CLOSED'")
+        followups = c.fetchall()
+        c.execute("SELECT user_id FROM leads WHERE vip = 1")
+        vip_count = len(c.fetchall())
+
+        print("=== VELOARXF LIVE DASHBOARD ===\n")
+        print("Users Summary:")
+        for count, category in users:
+            print(f" - {category}: {count} users")
+        print("\nLeads Summary:")
+        for count, stage, vip in leads:
+            label = "VIP" if vip else "Normal"
+            print(f" - {stage} ({label}): {count} leads")
+        print(f"\nPending Follow-Ups: {len(followups)}")
+        for uid, last in followups:
+            last_time = datetime.fromisoformat(last).strftime("%Y-%m-%d %H:%M")
+            print(f" - User ID {uid}, last contacted: {last_time}")
+        print(f"\nVIPs currently active: {vip_count}")
+        print("\n============================")
+        time.sleep(DASHBOARD_REFRESH)
+
+# ================= QUICK COMMANDS =================
+def show_stats():
+    print("=== VELOARXF QUICK STATS ===\n")
+    c.execute("SELECT COUNT(*), category FROM users GROUP BY category")
+    users = c.fetchall()
+    print("Users Summary:")
+    for count, category in users:
+        print(f" - {category}: {count} users")
+    c.execute("SELECT COUNT(*), stage, vip FROM leads GROUP BY stage, vip")
+    leads = c.fetchall()
+    print("\nLeads Summary:")
+    for count, stage, vip in leads:
+        label = "VIP" if vip else "Normal"
+        print(f" - {stage} ({label}): {count} leads")
+    c.execute("SELECT user_id, last_contact FROM leads WHERE stage != 'CLOSED'")
+    followups = c.fetchall()
+    print(f"\nPending Follow-Ups: {len(followups)}")
+    c.execute("SELECT user_id FROM leads WHERE vip = 1")
+    vip_count = len(c.fetchall())
+    print(f"\nVIPs currently active: {vip_count}")
+    print("\n============================\n")
+
+def alert_vip(user_id, message):
+    c.execute("UPDATE leads SET vip=1 WHERE user_id=?", (user_id,))
+    db.commit()
+    print(f"🚨 VIP ALERT: User ID {user_id}\nMessage: {message}\n")
+
+def send_message(user_id, message):
+    print(f"📨 Message to User ID {user_id}:\n{message}\n")
+
+# ================= MAIN =================
+def main():
+    while True:
+        try:
+            updater = Updater(BOT_TOKEN, use_context=True)
+            dp = updater.dispatcher
+            dp.add_handler(CommandHandler("start", start))
+            dp.add_handler(CommandHandler("warn", warn))
+            dp.add_handler(CommandHandler("mute", mute))
+            dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
+            threading.Thread(target=follow_up_loop, args=(updater.bot,), daemon=True).start()
+            threading.Thread(target=dashboard_loop, daemon=True).start()
+            print("🚀 VeloraXF Level 10 Ultimate Bot is running.")
+            updater.start_polling()
+            updater.idle()
+        except Exception as e:
+            print(f"⚠️ Bot crashed! Restarting in 5s... Error: {e}")
+            time.sleep(5)
+
+if __name__ == "__main__":
+    main()
